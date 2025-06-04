@@ -1,6 +1,4 @@
 
-# TameMini-GS: A Hybrid Approach for Efficient and Compact 3D Gaussian Splatting
-
 ### (1) Setup
 This code has been tested with Python 3.8, torch 1.12.1, CUDA 11.6.
 
