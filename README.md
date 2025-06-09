@@ -1,17 +1,15 @@
 
-# TameMini-GS: A Hybrid Approach for Efficient and Compact 3D Gaussian Splatting
-
 ### (1) Setup
 This code has been tested with Python 3.8, torch 1.12.1, CUDA 11.6.
 
 - Clone the repository 
 ```
-
+git clone https://github.com/trungphien/TameMini-GS.git
 ```
 - Setup python environment
 ```
-conda create -n mini_splatting2 python=3.8
-conda activate mini_splatting2
+conda create -n tame_mini python=3.8
+conda activate tame_mini
 pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 -f https://download.pytorch.org/whl/torch_stable.html
 pip install -r requirements.txt
 ```
