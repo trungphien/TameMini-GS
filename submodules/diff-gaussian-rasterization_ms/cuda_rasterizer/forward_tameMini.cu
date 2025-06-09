@@ -17,6 +17,7 @@
 #include <cub/cub.cuh>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include "stopthepop_common.cuh"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -160,7 +161,6 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 	cov3D[5] = Sigma[2][2];
 }
 
-// Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
 	const float* orig_points,
@@ -191,100 +191,108 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const bool* culling,
 	bool prefiltered)
 {
-	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P)
-		return;
+    auto idx = cg::this_grid().thread_rank();
+    if (idx >= P)
+        return;
 
-	// Initialize radius and touched tiles to 0. If this isn't changed,
-	// this Gaussian will not be processed further.
-	radii[idx] = 0;
-	tiles_touched[idx] = 0;
+    // Khởi tạo giá trị mặc định
+    radii[idx] = 0;
+    tiles_touched[idx] = 0;
 
-	if (culling[idx])
-		return;
+    if (culling[idx])
+        return;
 
-	// Perform near culling, quit if outside.
-	float3 p_view;
-	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
-		return;
+    // Kiểm tra frustum culling
+    float3 p_view;
+    if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
+        return;
 
-	// Transform point by projecting
-	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
-	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
-	float p_w = 1.0f / (p_hom.w + 0.0000001f);
-	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+    // Transform point
+    float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
+    float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+    float p_w = 1.0f / (p_hom.w + 0.0000001f);
+    float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
-	// If 3D covariance matrix is precomputed, use it, otherwise compute
-	// from scaling and rotation parameters. 
-	const float* cov3D;
-	if (cov3D_precomp != nullptr)
-	{
-		cov3D = cov3D_precomp + idx * 6;
-	}
-	else
-	{
-		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
-		cov3D = cov3Ds + idx * 6;
-	}
+    // Tính covariance matrix 3D
+    const float* cov3D;
+    if (cov3D_precomp != nullptr)
+    {
+        cov3D = cov3D_precomp + idx * 6;
+    }
+    else
+    {
+        computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+        cov3D = cov3Ds + idx * 6;
+    }
 
-	// Compute 2D screen-space covariance matrix
-	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+    // Tính covariance matrix 2D
+    float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
 
-	// Invert covariance (EWA algorithm)
-	float det = (cov.x * cov.z - cov.y * cov.y);
-	if (det == 0.0f)
-		return;
-	float det_inv = 1.f / det;
-	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
+    // Tính inverse covariance
+    float det = (cov.x * cov.z - cov.y * cov.y);
+    if (det == 0.0f)
+        return;
+    float det_inv = 1.f / det;
+    float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
-	// Compute extent in screen space (by finding eigenvalues of
-	// 2D covariance matrix). Use extent to compute a bounding rectangle
-	// of screen-space tiles that this Gaussian overlaps with. Quit if
-	// rectangle covers 0 tiles. 
-	float opacity = opacities[idx];
-	constexpr float alpha_threshold = 1.0f/255.0f;
-	const float opacity_power_threshold = log(opacity / alpha_threshold);
-	const float extent = min(3.33, sqrt(2.0f * opacity_power_threshold));	
+    // Tính extent và opacity threshold
+    float opacity = opacities[idx];
+    constexpr float alpha_threshold = 1.0f/255.0f;
+    const float opacity_power_threshold = log(opacity / alpha_threshold);
+    const float extent = min(3.33, sqrt(2.0f * opacity_power_threshold));    
 
-	float mid = 0.5f * (cov.x + cov.z);
-	float lambda = mid + sqrt(max(0.01f, mid * mid - det));
-	float my_radius = extent * sqrt(lambda);
-	if (my_radius <= 0.0f)
-		return;	
-	
-	// Tính screen-space extent của Gaussian
-	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
-	const float extent_x = min(extent * sqrt(cov.x), my_radius);
-	const float extent_y = min(extent * sqrt(cov.z), my_radius);
-	const float2 rect_dims = make_float2(extent_x, extent_y);
+    // Tính radius
+    float mid = 0.5f * (cov.x + cov.z);
+    float lambda = mid + sqrt(max(0.01f, mid * mid - det));
+    float my_radius = extent * sqrt(lambda);
+    if (my_radius <= 0.0f)
+        return;    
 
-	// Xác định tiles bị ảnh hưởng
-	uint2 rect_min, rect_max;
-	getRect(point_image, rect_dims, rect_min, rect_max, grid);	
-	// Tính số lượng tiles bị ảnh hưởng
-	const int tile_count_rect = (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y);
-	if (tile_count_rect == 0)
-		return;
+    // Tính screen-space position và extent
+    float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+    const float extent_x = min(extent * sqrt(cov.x), my_radius);
+    const float extent_y = min(extent * sqrt(cov.z), my_radius);
+    const float2 rect_dims = make_float2(extent_x, extent_y);
 
-	// If colors have been precomputed, use them, otherwise convert
-	// spherical harmonics coefficients to RGB color.
-	if (colors_precomp == nullptr)
-	{
-		glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, dc, shs, clamped);
-		rgb[idx * C + 0] = result.x;
-		rgb[idx * C + 1] = result.y;
-		rgb[idx * C + 2] = result.z;
-	}
+    // Xác định vùng tiles bị ảnh hưởng
+    uint2 rect_min, rect_max;
+    getRect(point_image, rect_dims, rect_min, rect_max, grid);
 
-	// Store some useful helper data for the next steps.
-	depths[idx] = p_view.z;
-	radii[idx] = (int) ceil(my_radius);
-	rects[idx] = rect_dims;
-	points_xy_image[idx] = point_image;
-	// Inverse 2D covariance and opacity neatly pack into one float4
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity };
-	// Lưu thông tin cho rasterization
-	tiles_touched[idx] = tile_count_rect;
+    // Thêm tile-based culling
+    int tile_count = 0;
+    const float4 co_init = make_float4(conic.x, conic.y, conic.z, 0.0f);
+    const float2 xy_init = point_image;
+
+    // Tính số tile cần kiểm tra
+    tile_count = computeTilebasedCullingTileCount<true>(
+        true,               // active
+        co_init,           // covariance matrix
+        xy_init,           // screen position
+        opacity_power_threshold,  // opacity threshold
+        rect_min,          // min bounds
+        rect_max           // max bounds
+    );
+
+    // Nếu không có tile nào cần render, return
+    if (tile_count == 0)
+        return;
+
+    // Tính màu sắc nếu chưa được precompute
+    if (colors_precomp == nullptr)
+    {
+        glm::vec3 result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, dc, shs, clamped);
+        rgb[idx * C + 0] = result.x;
+        rgb[idx * C + 1] = result.y;
+        rgb[idx * C + 2] = result.z;
+    }
+
+    // Lưu thông tin cho rasterization
+    depths[idx] = p_view.z;
+    radii[idx] = (int)ceil(my_radius);
+    rects[idx] = rect_dims;
+    points_xy_image[idx] = point_image;
+    conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity };
+    tiles_touched[idx] = tile_count;  // Số tile thực sự cần render sau khi culling
 }
 
 // Main rasterization method. Collaboratively works on one tile per

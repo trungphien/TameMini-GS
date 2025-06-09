@@ -443,6 +443,7 @@ PerGaussianRenderCUDA(
 	// What is the number of buckets before me? what is my offset?
 	bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
 	bucket_idx_in_tile = global_bucket_idx - bbm;
+	// Mỗi index của Splat được gán cho một thread trong warp
 	splat_idx_in_tile = bucket_idx_in_tile * 32 + my_warp.thread_rank();
 	splat_idx_global = range.x + splat_idx_in_tile;
 	valid_splat = (splat_idx_in_tile < num_splats_in_tile);
@@ -480,20 +481,23 @@ PerGaussianRenderCUDA(
 	const uint2 pix_min = {tile.x * BLOCK_X, tile.y * BLOCK_Y};
 
 	// values useful for gradient calculation
-	float T;
-	float T_final;
-	float last_contributor;
-	float ar[C];
+	float T; // T: Transmittance (độ trong suốt tích lũy)
+	float T_final;  // T_final: Final transmittance for the pixel
+	float last_contributor; // last_contributor: Số Gaussian đóng góp vào pixel
+	float ar[C]; // Lưu trữ màu đã nhân với alpha và transmittance
 	float dL_dpixel[C];
-	const float ddelx_dx = 0.5 * W;
+	const float ddelx_dx = 0.5 * W; // ddelx_dx: Scaling factor cho gradient vị trí theo x,  Chuyển đổi từ screen space sang normalized space
 	const float ddely_dy = 0.5 * H;
 
 	// iterate over all pixels in the tile
+	// BLOCK_SIZE = BLOCK_X * BLOCK_Y = 16 * 16 = 256
+    // +31 để đảm bảo xử lý hết tất cả pixels trong warp cuối, (vì mỗi warp có 32 threads)
 	for (int i = 0; i < BLOCK_SIZE + 31; ++i) {
 		// SHUFFLING
 
 		// At this point, T already has my (1 - alpha) multiplied.
 		// So pass this ready-made T value to next thread.
+		// shfl_up: Dịch giá trị lên 1 thread trong warp
 		T = my_warp.shfl_up(T, 1);
 		last_contributor = my_warp.shfl_up(last_contributor, 1);
 		T_final = my_warp.shfl_up(T_final, 1);
@@ -505,6 +509,7 @@ PerGaussianRenderCUDA(
 		// which pixel index should this thread deal with?
 		int idx = i - my_warp.thread_rank();
 		const uint2 pix = {pix_min.x + idx % BLOCK_X, pix_min.y + idx / BLOCK_X};
+		// Chuyển từ tọa độ 2D sang 1D index
 		const uint32_t pix_id = W * pix.y + pix.x;
 		const float2 pixf = {(float) pix.x, (float) pix.y};
 		bool valid_pixel = pix.x < W && pix.y < H;
@@ -513,15 +518,21 @@ PerGaussianRenderCUDA(
 		// TODO: perhaps store these things in shared memory?
 		if (valid_splat && valid_pixel && my_warp.thread_rank() == 0 && idx < BLOCK_SIZE) {
 			T = sampled_T[global_bucket_idx * BLOCK_SIZE + idx];
-			T_final = final_Ts[pix_id];
+			T_final = final_Ts[pix_id]; // Lấy giá trị transmittance cuối cùng của pixel
+			
 			for (int ch = 0; ch < C; ++ch)
+				// A. pixel_colors[ch * H * W + pix_id]: Màu cuối cùng của pixel (kết quả final render)
+				// B. T_final * bg_color[ch]: Đóng góp của background
+				// C. (A - B): Loại bỏ đóng góp của background
+				// D. -(A - B): Đảo ngược giá trị, chuẩn bị cho việc cộng với sampled_ar
 				ar[ch] = -(pixel_colors[ch * H * W + pix_id] - T_final * bg_color[ch]) + sampled_ar[global_bucket_idx * BLOCK_SIZE * C + ch * BLOCK_SIZE + idx];
+			// Lấy số lượng Gaussian đã đóng góp vào pixel này, dùng để kiểm tra điều kiện dừng
 			last_contributor = n_contrib[pix_id];
 			for (int ch = 0; ch < C; ++ch) {
 				dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
 			}
 		}
-
+	
 		// do work
 		if (valid_splat && valid_pixel && 0 <= idx && idx < BLOCK_SIZE) {
 			if (W <= pix.x || H <= pix.y) continue;
@@ -529,11 +540,12 @@ PerGaussianRenderCUDA(
 			if (splat_idx_in_tile >= last_contributor) continue;
 
 			// compute blending values
+			// Tính vector khoảng cách từ center của Gaussian đến pixel
 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f) continue;
 			const float G = exp(power);
-			const float alpha = min(0.99f, con_o.w * G);
+			const float alpha = min(0.99f, con_o.w * G);  // Alpha (opacity) với clamp ở 0.99
 			if (alpha < 1.0f / 255.0f) continue;
 			const float dchannel_dcolor = alpha * T;
 
@@ -541,32 +553,38 @@ PerGaussianRenderCUDA(
 			float bg_dot_dpixel = 0.0f;
 			float dL_dalpha = 0.0f;
 			for (int ch = 0; ch < C; ++ch) {
+				// Tích lũy màu với alpha blending
 				ar[ch] += T * alpha * c[ch];
+				// Lấy gradient pixel hiện tại
 				const float &dL_dchannel = dL_dpixel[ch];
+				// Cập nhật gradient cho colors của Gaussian bằng quy tắc chuỗi
 				Register_dL_dcolors[ch] += dchannel_dcolor * dL_dchannel;
 				dL_dalpha += ((c[ch] * T) - (1.0f / (1.0f - alpha)) * (-ar[ch])) * dL_dchannel;
 
 				bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
 			}
 			dL_dalpha += (-T_final / (1.0f - alpha)) * bg_dot_dpixel;
+			// Cập nhật transmittance
 			T *= (1.0f - alpha);
 
 
 			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
+			const float dL_dG = con_o.w * dL_dalpha; // gradient từ loss đến Gaussian value
 			const float gdx = G * d.x;
 			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+			// Tính đạo hàm của G với respect to delx và dely
+			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y; // = -G * (d.x * con_o.x + d.y * con_o.y)
+			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y; // = -G * (d.y * con_o.z + d.x * con_o.y)
 
 			// accumulate the gradients
+			// Tích lũy gradients cho mean2D:
 			const float tmp_x = dL_dG * dG_ddelx * ddelx_dx;
 			Register_dL_dmean2D_x += tmp_x;
 			const float tmp_y = dL_dG * dG_ddely * ddely_dy;
 			Register_dL_dmean2D_y += tmp_y;
 
 			if(con_o.w*G > 0.99f) continue;
-
+			//Tích lũy gradients cho conic parameters:
 			Register_dL_dconic2D_x += -0.5f * gdx * d.x * dL_dG;
 			Register_dL_dconic2D_y += -0.5f * gdx * d.y * dL_dG;
 			Register_dL_dconic2D_w += -0.5f * gdy * d.y * dL_dG;
@@ -575,6 +593,7 @@ PerGaussianRenderCUDA(
 	}
 
 	// finally add the gradients using atomics
+	// Atomic operation: đảm bảo Không có race condition
 	if (valid_splat) {
 		atomicAdd(&dL_dmean2D[gaussian_idx].x, Register_dL_dmean2D_x);
 		atomicAdd(&dL_dmean2D[gaussian_idx].y, Register_dL_dmean2D_y);
