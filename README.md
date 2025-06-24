@@ -44,11 +44,11 @@ python full_eval.py -m360 <mipnerf360 folder> -tat <tanks and temples folder> -d
 ```
 cd ms_c
 ```
-- Compress, decompress and evaluate (use the model path of the pretrained Mini-Splatting):
+- Compress, decompress, and evaluate (use the model path of the pretrained Mini-Splatting):
 ```
 python run.py -s <dataset path> -m <model path>
 ```
-**Acknowledgement.** This project is built upon [Mini-Splatting](https://github.com/fatPeter/mini-splatting), [3DGS](https://github.com/graphdeco-inria/gaussian-splatting) and [Taming 3DGS](https://github.com/humansensinglab/taming-3dgs).
+**Acknowledgement.** This project is built upon [Mini-Splatting](https://github.com/fatPeter/mini-splatting), [3DGS](https://github.com/graphdeco-inria/gaussian-splatting), [Taming 3DGS](https://github.com/humansensinglab/taming-3dgs). and [Mini-Splatting2](https://github.com/fatPeter/mini-splatting2)
 
 
 
