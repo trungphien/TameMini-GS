@@ -1,3 +1,5 @@
+# TameMini-GS: A Hybrid Approach for Efficient and Compact 3D Gaussian Splatting 
+This is the official implementation of **TameMini-GS**,  a model that integrates optimization techniques from Mini-Splatting, Taming3DGS, and a coarse-to-fine training approach to effectively balance training time, rendering quality, and compact 3DGS representation.
 
 ### (1) Setup
 This code has been tested with Python 3.8, torch 1.12.1, CUDA 11.6.
